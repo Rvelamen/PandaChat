@@ -32,10 +32,32 @@ class MCPConnection:
         self.capabilities: Optional[ServerCapabilities] = None
         self.tools: Dict[str, dict] = {}
         self._transport_client = None
-        self._session_context = None
+        self._session_context: Optional[Callable[[], Optional[str]]] = None
         self._shutdown_event = Event()
         self._initialized_event = Event()
+        self.session_id: Optional[str] = None
         self.error_info = ""
+
+    def _config_value(self, key: str, default: Any = None) -> Any:
+        """
+        Helper to retrieve configuration values.
+        Prefers top-level keys, falls back to nested `config` payloads.
+        """
+        if key in self.config and self.config[key] is not None:
+            return self.config[key]
+        nested = self.config.get("config") or {}
+        return nested.get(key, default)
+
+    def bind_session_tracker(
+        self, session_getter: Optional[Callable[[], Optional[str]]]
+    ) -> None:
+        """Store the callback provided by transports that expose session IDs."""
+        self._session_context = session_getter
+
+    def refresh_session_state(self) -> None:
+        """Pull the latest session metadata from the transport if available."""
+        if self._session_context:
+            self.session_id = self._session_context()
 
     def transport_context_factory(self):
         if self.config["transport"] == "stdio":
@@ -47,56 +69,42 @@ class MCPConnection:
             # Create stdio client config with redirected stderr
             return stdio_client(server=server_params)
         elif self.config["transport"] in ["streamable_http", "streamable-http", "http"]:
-            if self.config["session_id"]:
-                headers = (
-                    self.config["headers"].copy() if self.config["headers"] else {}
-                )
-                headers[MCP_SESSION_ID] = self.config["session_id"]
-            else:
-                headers = self.config.headers
+            headers = (self._config_value("headers", {}) or {}).copy()
+            if self.session_id:
+                headers[MCP_SESSION_ID] = self.session_id
 
             kwargs = {
-                "url": self.config.url,
+                "url": self._config_value("url"),
                 "headers": headers,
-                "terminate_on_close": self.config.terminate_on_close,
+                "terminate_on_close": self._config_value("terminate_on_close", True),
             }
 
-            timeout = (
-                timedelta(seconds=self.config.http_timeout_seconds)
-                if self.config.http_timeout_seconds
-                else None
-            )
+            timeout_seconds = self._config_value("http_timeout_seconds")
+            if timeout_seconds:
+                kwargs["timeout"] = timedelta(seconds=timeout_seconds)
 
-            if timeout is not None:
-                kwargs["timeout"] = timeout
-
-            sse_read_timeout = (
-                timedelta(seconds=self.config.read_timeout_seconds)
-                if self.config.read_timeout_seconds
-                else None
-            )
-
-            if sse_read_timeout is not None:
-                kwargs["sse_read_timeout"] = sse_read_timeout
+            sse_read_timeout_seconds = self._config_value("read_timeout_seconds")
+            if sse_read_timeout_seconds:
+                kwargs["sse_read_timeout"] = timedelta(seconds=sse_read_timeout_seconds)
 
             return streamablehttp_client(
                 **kwargs,
             )
         elif self.config["transport"] == "sse":
             kwargs = {
-                "url": self.config["url"],
-                "headers": self.config.get("headers", {}),
+                "url": self._config_value("url"),
+                "headers": self._config_value("headers", {}),
             }
 
-            if self.config.get("http_timeout_seconds"):
-                kwargs["timeout"] = self.config.get("http_timeout_seconds")
+            if self._config_value("http_timeout_seconds"):
+                kwargs["timeout"] = self._config_value("http_timeout_seconds")
 
-            if self.config.get("read_timeout_seconds"):
-                kwargs["sse_read_timeout"] = self.config.get("read_timeout_seconds")
+            if self._config_value("read_timeout_seconds"):
+                kwargs["sse_read_timeout"] = self._config_value("read_timeout_seconds")
 
             return sse_client(**kwargs)
         elif self.config["transport"] == "websocket":
-            return websocket_client(url=self.config["url"])
+            return websocket_client(url=self._config_value("url"))
         else:
             raise ValueError(f"Unsupported transport: {self.config['transport']}")
 
@@ -182,6 +190,8 @@ async def _server_lifecycle_task(server_conn: MCPConnection) -> None:
         transport_context = server_conn.transport_context_factory()
 
         async with transport_context as (read_stream, write_stream, *extras):
+            session_tracker = extras[0] if extras else None
+            server_conn.bind_session_tracker(session_tracker)
 
             # Build a session
             await server_conn.create_session(read_stream, write_stream)
@@ -189,6 +199,7 @@ async def _server_lifecycle_task(server_conn: MCPConnection) -> None:
             async with server_conn.session:
                 # Initialize the session
                 await server_conn.initialize_session()
+                server_conn.refresh_session_state()
 
                 # Wait until we're asked to shut down
                 await server_conn.wait_for_shutdown_request()
